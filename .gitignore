@@ -202,3 +202,5 @@ sticker-descriptions/
 
 # Cyrene agent
 .cyrene/
+/.asar-extract
+/release2

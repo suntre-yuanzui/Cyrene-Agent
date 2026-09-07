@@ -115,6 +115,7 @@ const DEFAULT_GENERAL_SETTINGS: GeneralSettings = {
   asrAliyunAppKey: "",
   asrAliyunAccessKeyId: "",
   asrAliyunAccessKeySecret: "",
+  asrLocalUrl: "http://127.0.0.1:9881",
   asrLanguage: "zh",
   asrVadSilenceMs: 1000,
   asrVadThreshold: 0.01,
@@ -287,6 +288,9 @@ export function normalizeGeneralSettings(
     asrAliyunAppKey: typeof input?.asrAliyunAppKey === "string" ? input.asrAliyunAppKey : "",
     asrAliyunAccessKeyId: typeof input?.asrAliyunAccessKeyId === "string" ? input.asrAliyunAccessKeyId : "",
     asrAliyunAccessKeySecret: typeof input?.asrAliyunAccessKeySecret === "string" ? input.asrAliyunAccessKeySecret : "",
+    asrLocalUrl: typeof input?.asrLocalUrl === "string" && input.asrLocalUrl.trim()
+      ? input.asrLocalUrl.trim()
+      : DEFAULT_GENERAL_SETTINGS.asrLocalUrl,
     asrLanguage: ["zh", "en", "auto"].includes(String(input?.asrLanguage))
       ? (input!.asrLanguage as "zh" | "en" | "auto")
       : "zh",

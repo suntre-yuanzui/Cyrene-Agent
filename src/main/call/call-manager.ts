@@ -159,7 +159,8 @@ export function startCall(): void {
   const cfg = getAsrConfig();
   const missingConfig = !cfg
     || (cfg.engine === "aliyun" && (!cfg.appKey || !cfg.accessKeyId || !cfg.accessKeySecret))
-    || (cfg.engine === "mossland" && !cfg.apiKey);
+    || (cfg.engine === "mossland" && !cfg.apiKey)
+    || (cfg.engine === "local" && !cfg.url);
   if (missingConfig) {
     sendError("ASR 未配置：请在设置→ASR 中选择服务商并填写凭据");
     sendState("ERROR");

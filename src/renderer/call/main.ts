@@ -70,6 +70,7 @@ function drawParticles(): void {
 
 // ── DOM 元素 ──
 const statusEl = document.getElementById("call-status") as HTMLElement;
+const deviceSelectEl = document.getElementById("device-select") as HTMLSelectElement | null;
 const ringEl = document.getElementById("avatar-ring") as HTMLElement;
 const waveformCanvas = document.getElementById("waveform-canvas") as HTMLCanvasElement | null;
 const micWaveEl = document.getElementById("mic-wave") as HTMLButtonElement;
@@ -298,23 +299,53 @@ let analyser: AnalyserNode | null = null;
 let workletNode: AudioWorkletNode | null = null;
 let micStream: MediaStream | null = null;
 let vadSilenceTimer: ReturnType<typeof setTimeout> | null = null;
+let vadInterval: ReturnType<typeof setInterval> | null = null;
 let vadSilenceMs = 1000;
-let vadThreshold = 0.01; // 音量阈值，默认调低照顾安静环境/小声麦克风
+let vadThreshold = 0.01; // 绝对音量下限（设置项），自适应基线会在此之上叠加
 let hasSpoken = false; // 用户是否已开始说话（VAD 只在说过话后检测静默）
+let vadTimeData: Uint8Array | null = null; // 时域数据（RMS 计算）
+let noiseFloor = 0; // 自适应噪声基线（RMS）
+let noiseCalibFrames = 10; // 启动后先校准 10 帧（1s）取环境底噪
+let speechStreak = 0; // 连续高于阈值的帧数
+let totalSpeechMs = 0; // 本轮累计语音时长
 
-async function startMicrophone(): Promise<void> {
+/** 重置本轮语音判定状态（不重置噪声基线）。 */
+function resetVadTurn(): void {
+  hasSpoken = false;
+  speechStreak = 0;
+  totalSpeechMs = 0;
+}
+
+/** 确保 AudioContext 处于 running（自动播放策略下，无用户手势时可能 suspended）。 */
+async function ensureAudioRunning(): Promise<void> {
+  if (audioContext && audioContext.state === "suspended") {
+    try {
+      await audioContext.resume();
+      console.log("[Call] AudioContext 已恢复:", audioContext.state);
+    } catch (err) {
+      console.warn("[Call] AudioContext resume 失败:", err);
+    }
+  }
+}
+
+async function startMicrophone(deviceId?: string): Promise<void> {
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        sampleRate: 16000,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
+    const audioConstraints: MediaTrackConstraints = {
+      sampleRate: 16000,
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+    };
+    if (deviceId) {
+      audioConstraints.deviceId = { exact: deviceId };
+    }
+
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
 
     audioContext = new AudioContext({ sampleRate: 16000 });
     await audioContext.audioWorklet.addModule(new URL("./pcm-processor.js", import.meta.url));
+    // 尝试恢复；若因无用户手势失败，后续任意点击会再次恢复。
+    void ensureAudioRunning();
 
     const source = audioContext.createMediaStreamSource(micStream);
 
@@ -322,6 +353,7 @@ async function startMicrophone(): Promise<void> {
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     analyserData = new Uint8Array(analyser.frequencyBinCount);
+    vadTimeData = new Uint8Array(analyser.fftSize);
     source.connect(analyser);
 
     // AudioWorkletNode 用于 PCM 采集
@@ -333,7 +365,7 @@ async function startMicrophone(): Promise<void> {
     source.connect(workletNode);
     // workletNode 不连 destination（不需要本地回放）
 
-    console.log("[Call] 麦克风已启动");
+    console.log("[Call] 麦克风已启动", deviceId ? `deviceId=${deviceId.slice(0, 8)}…` : "(默认设备)");
     startVAD();
   } catch (err) {
     console.error("[Call] 麦克风启动失败:", err);
@@ -342,54 +374,150 @@ async function startMicrophone(): Promise<void> {
   }
 }
 
-/** VAD 静默检测：连续 N ms 低于阈值判定说完 */
+/** VAD 静默检测：自适应噪声基线 + 最短语音时长，忽略环境噪音与短促杂音。 */
 function startVAD(): void {
+  const FRAME_MS = 100;
+  const MIN_SPEECH_MS = 300;
+  const MIN_SPEECH_FRAMES = Math.max(1, Math.round(MIN_SPEECH_MS / FRAME_MS));
   let logCounter = 0;
-  const checkInterval = setInterval(() => {
-    if (!analyser || !analyserData) return;
+
+  vadInterval = setInterval(() => {
+    if (!analyser || !vadTimeData) return;
     if (currentState !== "LISTENING") return;
 
-    analyser.getByteFrequencyData(analyserData);
-    // 计算平均音量
+    analyser.getByteTimeDomainData(vadTimeData);
+    // RMS（时域能量，比频域均值更能反映真实响度）
     let sum = 0;
-    for (let i = 0; i < analyserData.length; i++) sum += analyserData[i];
-    const avg = sum / analyserData.length / 255;
+    for (let i = 0; i < vadTimeData.length; i++) {
+      const v = (vadTimeData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / vadTimeData.length);
+
+    // 启动后先校准 1s：取环境底噪最大值作为初始基线，期间不判定
+    if (noiseCalibFrames > 0) {
+      noiseCalibFrames--;
+      noiseFloor = Math.max(noiseFloor, rms);
+      if (noiseCalibFrames === 0) {
+        console.log("[Call VAD] 噪声基线校准完成 floor=", noiseFloor.toFixed(4));
+      }
+      return;
+    }
+
+    // 判定阈值：基线 ×2.5 + 绝对余量，且不低于设置里的绝对下限
+    const threshold = Math.max(vadThreshold, noiseFloor * 2.5 + 0.003);
+    const isVoice = rms >= threshold;
+
+    // 噪声基线自适应：静默时平滑跟踪底噪；说话时极缓慢上浮（应对环境噪声渐增）
+    if (!isVoice) {
+      noiseFloor = noiseFloor * 0.98 + rms * 0.02;
+    } else if (noiseFloor < 0.08) {
+      noiseFloor += 0.0001;
+    }
 
     logCounter++;
     if (logCounter % 10 === 0) {
-      console.log("[Call VAD] volume=", avg.toFixed(4), "threshold=", vadThreshold, "hasSpoken=", hasSpoken);
+      console.log(
+        "[Call VAD] rms=", rms.toFixed(4),
+        "floor=", noiseFloor.toFixed(4),
+        "threshold=", threshold.toFixed(4),
+        "streak=", speechStreak,
+        "spoken=", hasSpoken,
+      );
     }
 
-    if (avg >= vadThreshold) {
-      // 有声音：标记已开始说话，重置静默计时
-      if (!hasSpoken) console.log("[Call VAD] 开始说话 detected, volume=", avg.toFixed(4));
-      hasSpoken = true;
-      if (vadSilenceTimer) {
-        clearTimeout(vadSilenceTimer);
-        vadSilenceTimer = null;
+    if (isVoice) {
+      speechStreak++;
+      totalSpeechMs += FRAME_MS;
+      if (!hasSpoken && speechStreak >= MIN_SPEECH_FRAMES) {
+        hasSpoken = true;
+        console.log("[Call VAD] 检测到说话（持续", speechStreak * FRAME_MS, "ms）");
       }
-    } else if (hasSpoken) {
-      // 静默且之前说过话：开始静默计时
-      if (!vadSilenceTimer) {
-        console.log("[Call VAD] 静默开始，准备结束本轮");
-        vadSilenceTimer = setTimeout(() => {
-          console.log("[Call] VAD 静默检测触发，结束本轮");
-          vadSilenceTimer = null;
-          hasSpoken = false;
-          turnSubmitter?.request();
-        }, vadSilenceMs);
+      // 说话期间清掉静默计时
+      if (vadSilenceTimer) { clearTimeout(vadSilenceTimer); vadSilenceTimer = null; }
+    } else {
+      speechStreak = 0;
+      if (hasSpoken) {
+        // 静默且之前说过话：开始静默计时
+        if (!vadSilenceTimer) {
+          console.log("[Call VAD] 静默开始，准备结束本轮");
+          vadSilenceTimer = setTimeout(() => {
+            console.log("[Call VAD] 静默", vadSilenceMs, "ms 触发结束，本轮语音", totalSpeechMs, "ms");
+            vadSilenceTimer = null;
+            resetVadTurn();
+            turnSubmitter?.request();
+          }, vadSilenceMs);
+        }
       }
     }
-  }, 100);
+  }, FRAME_MS);
 }
 
 function stopMicrophone(): void {
+  if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
   if (vadSilenceTimer) { clearTimeout(vadSilenceTimer); vadSilenceTimer = null; }
   if (workletNode) { try { workletNode.disconnect(); } catch { /* ignore */ } workletNode = null; }
   if (analyser) { try { analyser.disconnect(); } catch { /* ignore */ } analyser = null; }
   if (audioContext) { try { audioContext.close(); } catch { /* ignore */ } audioContext = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  analyserData = null;
+  vadTimeData = null;
+  noiseFloor = 0;
+  noiseCalibFrames = 10;
+  resetVadTurn();
 }
+
+// ── 音频设备选择 ──
+const DEVICE_STORAGE_KEY = "cyrene.call.micDeviceId";
+
+function selectedDeviceId(): string {
+  try { return localStorage.getItem(DEVICE_STORAGE_KEY) ?? ""; } catch { return ""; }
+}
+
+/** 枚举输入设备并刷新下拉框；未授权时 label 可能为空，用序号兜底。 */
+async function refreshDeviceList(): Promise<void> {
+  if (!deviceSelectEl) return;
+  const saved = selectedDeviceId();
+  let inputs: MediaDeviceInfo[] = [];
+  try {
+    inputs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+  } catch { /* 无权限时忽略，保留下拉框现状 */ }
+
+  const current = inputs.some(d => d.deviceId === saved) ? saved : "";
+  deviceSelectEl.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = "默认设备";
+  deviceSelectEl.appendChild(def);
+
+  let fallbackIndex = 1;
+  for (const d of inputs) {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label && d.label.trim() ? d.label : `麦克风 ${fallbackIndex}`;
+    deviceSelectEl.appendChild(opt);
+    fallbackIndex += 1;
+  }
+  deviceSelectEl.value = current;
+}
+
+/** 切换麦克风设备：停止旧流，按新 deviceId 重启（仅聆听态自动重启）。 */
+async function switchDevice(deviceId: string): Promise<void> {
+  try { localStorage.setItem(DEVICE_STORAGE_KEY, deviceId); } catch { /* ignore */ }
+  stopMicrophone();
+  if (currentState === "LISTENING") {
+    await startMicrophone(deviceId || undefined);
+  }
+}
+
+deviceSelectEl?.addEventListener("change", () => {
+  void ensureAudioRunning();
+  void switchDevice(deviceSelectEl.value);
+});
+
+// 任意用户手势后恢复 AudioContext：自动播放策略可能让 context 初始 suspended
+// （这正是“对着麦说话却无反应”的根因——VAD 读到恒 0 音量，永远不触发提交）。
+document.addEventListener("click", () => { void ensureAudioRunning(); }, { passive: true });
 
 // ── TTS 播放 + Live2D 嘴型联动 ──
 // 复用聊天窗口的逻辑：音频播放时通过 live2dSpeech IPC 让宠物窗口小人嘴巴张合。
@@ -496,7 +624,7 @@ turnSubmitter = createTurnSubmitter({
       clearTimeout(vadSilenceTimer);
       vadSilenceTimer = null;
     }
-    hasSpoken = false;
+    resetVadTurn();
     window.call?.turnEnd();
   },
 });
@@ -569,6 +697,12 @@ async function init(): Promise<void> {
   initWaveformCanvas();
   requestAnimationFrame(drawWaveform);
   requestAnimationFrame(animateMicWave);
+
+  // 音频设备：初始枚举 + 设备热插拔监听
+  await refreshDeviceList();
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    void refreshDeviceList();
+  });
 
   // 开始通话
   window.call?.start();

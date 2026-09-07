@@ -149,6 +149,8 @@ export interface GeneralSettings extends ChatAppearanceSettings {
   asrAliyunAccessKeyId: string;
   /** 阿里云 RAM AccessKey Secret */
   asrAliyunAccessKeySecret: string;
+  /** 本地 ASR 服务地址（GPT-SoVITS asr_api.py），默认 http://127.0.0.1:9881 */
+  asrLocalUrl: string;
   /** ASR 识别语言：zh(中文) | en(英文) | auto(自动) */
   asrLanguage: "zh" | "en" | "auto";
   /** VAD 静默检测阈值（毫秒），500~2000，默认 1000 */

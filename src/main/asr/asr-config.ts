@@ -11,7 +11,13 @@ export interface MosslandAsrConfig {
   apiKey: string;
 }
 
-export type AsrConfig = AliyunAsrConfig | MosslandAsrConfig;
+export interface LocalAsrConfig {
+  engine: "local";
+  url: string;
+  language: string;
+}
+
+export type AsrConfig = AliyunAsrConfig | MosslandAsrConfig | LocalAsrConfig;
 
 let asrConfigGetter: (() => AsrConfig | null) | null = null;
 
